@@ -2,6 +2,7 @@
 package httputil
 
 import (
+	b64 "encoding/base64"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -13,13 +14,16 @@ import (
 	"regexp"
 	"strconv"
 	"time"
+
+	netrc "github.com/jdxcode/netrc"
+	homedir "github.com/mitchellh/go-homedir"
 )
 
 var (
 	// DefaultTransport specifies the http.RoundTripper that is used for any network traffic, and may be replaced with a dummy implementation for unit testing.
 	DefaultTransport = http.DefaultTransport
 	// UserAgent is passed to every HTTP request as part of the 'User-Agent' header.
-	UserAgent = "Bazelisk"
+	UserAgent   = "Bazelisk"
 	linkPattern = regexp.MustCompile(`<(.*?)>; rel="(\w+)"`)
 
 	// RetryClock is used for waiting between HTTP request retries.
@@ -28,7 +32,7 @@ var (
 	MaxRetries = 4
 	// MaxRequestDuration defines the maximum amount of time that a request and its retries may take in total
 	MaxRequestDuration = time.Second * 30
-	retryHeaders = []string{"Retry-After", "X-RateLimit-Reset", "Rate-Limit-Reset"}
+	retryHeaders       = []string{"Retry-After", "X-RateLimit-Reset", "Rate-Limit-Reset"}
 )
 
 // Clock keeps track of time. It can return the current time, as well as move forward by sleeping for a certain period.
@@ -37,7 +41,7 @@ type Clock interface {
 	Now() time.Time
 }
 
-type realClock struct {}
+type realClock struct{}
 
 func (*realClock) Sleep(d time.Duration) {
 	time.Sleep(d)
@@ -77,7 +81,7 @@ func get(url, token string) (*http.Response, error) {
 
 	req.Header.Set("User-Agent", UserAgent)
 	if token != "" {
-		req.Header.Set("Authorization", "token "+token)
+		req.Header.Set("Authorization", token)
 	}
 	client := &http.Client{Transport: DefaultTransport}
 	deadline := RetryClock.Now().Add(MaxRequestDuration)
@@ -118,7 +122,7 @@ func getWaitPeriod(res *http.Response, attempt int) (time.Duration, error) {
 		}
 	}
 	// Let's just use exponential backoff: 1s + d1, 2s + d2, 4s + d3, 8s + d4 with dx being a random value in [0ms, 500ms]
-	return time.Duration(1 << uint(attempt)) * time.Second + time.Duration(rand.Intn(500)) * time.Millisecond, nil
+	return time.Duration(1<<uint(attempt))*time.Second + time.Duration(rand.Intn(500))*time.Millisecond, nil
 }
 
 func parseRetryHeader(value string) (time.Duration, error) {
@@ -131,6 +135,31 @@ func parseRetryHeader(value string) (time.Duration, error) {
 		return 0, err
 	}
 	return time.Until(t), nil
+}
+
+// Attempt to open ~/.netrc file and
+func TryFindNetrcFileCreds(machine string) (string, error) {
+	dir, err := homedir.Dir()
+	if err != nil {
+		return "", err
+	}
+
+	var file = filepath.Join(dir, ".netrc")
+	n, err := netrc.Parse(file)
+	if err != nil {
+		// netrc does not exist or we can't read it
+		return "", err
+	}
+
+	m := n.Machine(machine)
+	if m == nil {
+		return "", fmt.Errorf("could not find creds for %s in netrc %s", machine, file)
+	}
+
+	login := m.Get("login")
+	pwd := m.Get("password")
+	token := b64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", login, pwd)))
+	return fmt.Sprintf("Bearer %s", token), nil
 }
 
 // DownloadBinary downloads a file from the given URL into the specified location, marks it executable and returns its full path.
@@ -152,6 +181,9 @@ func DownloadBinary(originURL, destDir, destFile string) (string, error) {
 				os.Remove(tmpfile.Name())
 			}
 		}()
+
+		// Parse netrc file
+		bearer, err := TryFindNetrcFileCreds()
 
 		log.Printf("Downloading %s...", originURL)
 		resp, err := get(originURL, "")
@@ -236,6 +268,6 @@ func getNextURL(headers http.Header) string {
 		if m[2] == "next" {
 			return m[1]
 		}
-	}	
+	}
 	return ""
 }
